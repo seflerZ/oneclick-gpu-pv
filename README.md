@@ -11,3 +11,8 @@ _This script was inspired by [dantmnf](https://gist.github.com/dantmnf/9bf9972c1
 
 ## For Ubuntu(tested on 20.04 and 22.04)
 Downdload the 'ubuntu-gpu-pv.ps1' and 'dxgkrnl-dkms.zip' to Windows host folder. Execute 'ubuntu-gpu-pv.ps1' with Administrator. You must configured WSLg first. That is to say you must have a WSL being able to use the GPU. Due to limitation of SSH, you'll be asked for password many times.
+
+![屏幕截图 2022-07-05 144851 PNG](https://user-images.githubusercontent.com/2093588/179666690-01e4252a-9c97-44ca-a5cf-5dc627fb471b.jpg)
+
+### Know issues
+* The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.
