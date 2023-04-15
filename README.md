@@ -2,7 +2,7 @@
 Enable GPU-PV easily
 
 ##
-GPU Partition is a new Microsoft GPU virtualization technology avaiable in latest Win10 and Win11. However it is not configurable in a easy way( no GUI avaiable). This repository provides scripts for both Windows and Linux to enable GPU-PV easily.
+GPU Partition is a new Microsoft GPU virtualization technology avaiable in latest Win10 and Win11. However it is not configurable in an easy way( no GUI avaiable). This repository provides scripts for both Windows and Linux to enable GPU-PV easily.
 
 ## For Windows 10+
 Depending on your system local. If it is English based or zh-CN, just download 'win-gpu-pv.ps1' and execute with Administrator priviledge. Otherwise you should implement your own check label located in the script.
