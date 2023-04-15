@@ -1,4 +1,4 @@
-# onenclick-gpu-pv
+# oneclick-gpu-pv
 Enable GPU-PV easily
 
 ##
