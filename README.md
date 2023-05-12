@@ -16,5 +16,12 @@ _This script was inspired by [OlfillasOdikno](https://gist.github.com/OlfillasOd
 
 ![屏幕截图 2022-07-05 144851 PNG](https://user-images.githubusercontent.com/2093588/179666690-01e4252a-9c97-44ca-a5cf-5dc627fb471b.jpg)
 
+Execute the following scripts to install Nvidia CUDA.
+```
+wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.0-1_all.deb
+sudo dpkg -i cuda-keyring_1.0-1_all.deb
+sudo apt-get update
+sudo apt-get -y install cuda
+```
 ### Known issues
 * The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.
