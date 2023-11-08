@@ -25,7 +25,10 @@ sudo apt-get -y install cuda
 ```
 
 ## VA-API video acceleration
-If you want to use latest WSL2 VA-API video acceleration ability. replace the following environment variables in "/etc/profiles.d/d3d.sh".
+If you want to use latest WSL2 VA-API video acceleration ability. 
+1. First update mesa to latest version(>=23.0).
+2. `sudo apt install mesa-va-drivers vainfo`.
+3. Replace the following environment variables in "/etc/profiles.d/d3d.sh".
 ```
 export LIBVA_DRIVER_NAME=d3d12
 export MESA_LOADER_DRIVER_OVERRIDE=vgem
