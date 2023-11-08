@@ -23,5 +23,14 @@ sudo dpkg -i cuda-keyring_1.0-1_all.deb
 sudo apt-get update
 sudo apt-get -y install cuda
 ```
+
+## VA-API video acceleration
+If you want to use latest WSL2 VA-API video acceleration ability. replace the following environment variables in "/etc/profiles.d/d3d.sh".
+```
+export LIBVA_DRIVER_NAME=d3d12
+export MESA_LOADER_DRIVER_OVERRIDE=vgem
+```
+Then add your user to group "video" and "render". Now you can type "vainfo --display drm" to checkc if hardware codecs are shown.
+
 ### Known issues
 * The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.
