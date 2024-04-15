@@ -16,7 +16,7 @@ If (-not $cbsinf) {
 }
 
 $gpuName = $dev.FriendlyName
-$path = $dev.InstanceId.replace('\', '#').ToLower()
+$path = "\\?\" + $dev.InstanceId.replace('\', '#').ToLower() + "#{064092b3-625e-43bf-9eb5-dc845897dd59}\GPUPARAV"
 
 Stop-VM $vmName
 Start-Sleep -m 10000
@@ -47,6 +47,6 @@ wsl ssh $remoteAddr "sudo -S mv ~/lib/* /usr/lib;sudo -S ln -s /lib/libd3d12core
 #Install dxgknrl module
 wsl scp -r ./dxgkrnl-dkms.zip $remoteAddr\:~
 wsl ssh $remoteAddr "unzip ~/dxgkrnl-dkms.zip"
-wsl ssh $remoteAddr "chmod +x ~/dxgkrnl-dkms/install.sh;sudo -S ~/dxgkrnl-dkms/install.sh"
+wsl ssh $remoteAddr "cd ~/dxgkrnl-dkms;chmod +x ~/dxgkrnl-dkms/install.sh;sudo -S ~/dxgkrnl-dkms/install.sh"
 
 echo "ALL DONE, ENJOY"
