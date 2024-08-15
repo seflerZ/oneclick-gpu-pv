@@ -37,6 +37,10 @@ echo "Onclick GPU-PV for Ubuntu: using $remoteAddr"
 echo "------------------------"
 
 
+#Copy public key to remote to enable ssh login password free
+wsl ssh $remoteAddr -T "mkdir ~/.ssh;touch ~/.ssh/authorized_keys"
+wsl cat ~/.ssh/id_rsa.pub | ssh $remoteAddr -T "cat >> ~/.ssh/authorized_keys"
+
 #Copy drivers
 wsl ssh $remoteAddr "sudo -S mkdir -p $(echo /usr/lib/wsl/drivers/)"
 wsl scp -r /usr/lib/wsl/lib $remoteAddr\:~
