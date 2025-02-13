@@ -32,6 +32,7 @@ If you want to leverage the latest WSL2 video acceleration VA-API.
 ```
 export LIBVA_DRIVER_NAME=d3d12
 export MESA_LOADER_DRIVER_OVERRIDE=vgem
+export GST_VAAPI_DRM_DEVICE=/dev/dri/card0
 ```
 Then add your user to group "video" and "render". Now you can type "vainfo --display drm" to checkc if hardware codecs are shown.
 
