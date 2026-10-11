@@ -37,4 +37,5 @@ export GST_VAAPI_DRM_DEVICE=/dev/dri/card0
 Then add your user to group "video" and "render". Now you can type "vainfo --display drm" to checkc if hardware codecs are shown.
 
 ### Known issues
-_The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop._ Resolved by the GNOME version comes with Ubuntu 24.04
+~The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.~
+Resolved by the GNOME version comes with Ubuntu 24.04
