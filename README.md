@@ -9,7 +9,7 @@ Depending on your system local. If it is English based or zh-CN, just download '
 
 _This script was inspired by [dantmnf](https://gist.github.com/dantmnf/9bf9972c1ad49029cbdc2e40f1b7ac51)_
 
-## For Ubuntu(tested on 20.04 and 22.04)
+## For Ubuntu(tested on 22.04 and 24.04)
 Downdload the 'ubuntu-gpu-pv.ps1' and 'dxgkrnl-dkms.zip' to Windows host folder. Execute 'ubuntu-gpu-pv.ps1' with Administrator. You must configured WSLg first. That is to say you must have a WSL being able to use the GPU. If you didn't have ssh key generated in your WSL distro, you'll be asked for password many times.
 
 _This script was inspired by [OlfillasOdikno](https://gist.github.com/OlfillasOdikno/f87a4444f00984625558dad053255ace)_
@@ -37,4 +37,4 @@ export GST_VAAPI_DRM_DEVICE=/dev/dri/card0
 Then add your user to group "video" and "render". Now you can type "vainfo --display drm" to checkc if hardware codecs are shown.
 
 ### Known issues
-* The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.
+_The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop._ Resolved by the GNOME version comes with Ubuntu 24.04
