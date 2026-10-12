@@ -1,5 +1,4 @@
-#Requires -Version 5.1
-#Requires -RunAsAdministrator
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     One-click GPU-PV setup for Hyper-V Linux guests (no WSL distro required).
@@ -17,6 +16,9 @@
     The kernel module is built from staralt/dxgkrnl-dkms (auto-picks branch
     5.15 / 6.6 / 6.18 based on the running kernel).
 
+    -Stage Env also deploys the four Mesa/D3D12 variables into every place they are
+    needed, from one source of truth (see NOTES), as an idempotent marker block.
+
 .PARAMETER VMName
     Target Hyper-V VM name. If omitted, a CLI numbered picker is shown (no GUI).
 
@@ -26,18 +28,55 @@
 .PARAMETER GuestIP
     Guest IP (host can reach it directly). Default: 10.0.0.5.
 
+.PARAMETER GuestPort
+    SSH port on the guest. Default 22. Set it when reaching the guest through a
+    port-forward instead of the LAN - e.g. -GuestIP myguest.example.com -GuestPort 2222 lets the
+    guest-side stages (Ssh / Drivers / Guest / Env / Verify) run from anywhere.
+
 .PARAMETER Stage
-    Pipeline stage: All / GpuPv / Drivers / Guest / Verify / Undo / Ssh. Default: All.
+    Pipeline stage: All / GpuPv / Drivers / Guest / Env / Verify / Undo / Ssh. Default: All.
+    Env deploys the guest-side GPU-PV environment variables (see NOTES); Verify prints a
+    per-chain health check of them plus the D3D12/VAAPI/Vulkan probes.
+
+.PARAMETER Gpu
+    One or more partitionable GPUs to attach, by fuzzy name match. If omitted and the
+    host has more than one partitionable GPU, a CLI numbered picker is shown. With
+    -Force, all partitionable GPUs are attached automatically.
+
+.PARAMETER DesktopRendering
+    How the xrdp desktop session renders: Software (default) or Gpu.
+    Software pins GALLIUM_DRIVER=llvmpipe + MESA_LOADER_DRIVER_OVERRIDE=swrast in
+    /etc/xrdp/startwm.sh. Rationale: the xorgxrdp framebuffer lives in CPU memory, so a
+    GPU-composited desktop has to read every frame back across the VMbus before xrdp can
+    encode it - pure overhead for a drag-heavy workload. Cost: ~2x slower if that desktop
+    also runs heavy GPU apps. Gpu removes the override, so the session inherits the
+    d3d12 pair from /etc/environment.
+
+.PARAMETER DesktopApp
+    .desktop file name(s) in /usr/share/applications to clone into the user's profile with
+    the GPU env prefix on Exec= (so the dock app itself still gets the GPU, even while the
+    desktop session renders in software). Example: -DesktopApp 'com.microsoft.Edge.desktop'.
+    Omit to skip.
 
 .PARAMETER Force
-    Skip interactive prompts; auto-select the only VM when there is exactly one.
+    Skip interactive prompts; auto-select the only VM / single GPU.
 
 .EXAMPLE
     .\ubuntu-gpu-pv.ps1
 .EXAMPLE
     .\ubuntu-gpu-pv.ps1 -VMName MyGuestVM -GuestIP 10.0.0.5 -Force
 .EXAMPLE
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM
+.EXAMPLE
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -DesktopApp 'com.microsoft.Edge.desktop'
+.EXAMPLE
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -DesktopRendering Gpu
+.EXAMPLE
+    .\ubuntu-gpu-pv.ps1 -Stage Env -GuestIP myguest.example.com -GuestPort 2222
+.EXAMPLE
     .\ubuntu-gpu-pv.ps1 -Stage Verify
+.EXAMPLE
+    .\ubuntu-gpu-pv.ps1 -Stage GpuPv -Gpu "discrete GPU"
 .EXAMPLE
     .\ubuntu-gpu-pv.ps1 -Stage Undo
 .EXAMPLE
@@ -48,6 +87,38 @@
     Community / experimental. Any of: Windows update, NVIDIA driver bump,
     distro upgrade may break it. Do NOT install an ordinary nvidia-driver-*
     package inside the guest (it conflicts with the bridged NVIDIA libs).
+
+    Guest environment variables (-Stage Env) - four variables, one source of truth
+    ($GpuEnv / $SwEnv below), deployed by marker block so re-running is a no-op:
+
+        GALLIUM_DRIVER                   d3d12     <- the driver switch
+        MESA_LOADER_DRIVER_OVERRIDE      d3d12
+        MESA_D3D12_DEFAULT_ADAPTER_NAME  NVIDIA     <- which GPU
+        LIBVA_DRIVER_NAME                d3d12
+
+    Scope matters, and the four scopes are NOT interchangeable:
+
+        /etc/environment                  PAM (pam_env readenv=1) -> SSH sessions + systemd services
+        ~/.zshenv                         terminal started inside the desktop
+        /etc/xrdp/startwm.sh              the desktop session itself (llvmpipe/swrast by default)
+        ~/.local/share/applications/*.desktop   dock apps (env prefix on Exec=)
+
+    Two rules that cost people hours:
+
+      1. GALLIUM_DRIVER is what selects the driver, and leaving it UNSET is what makes Mesa
+         fall back to llvmpipe - not "missing half of a pair". Measured on this guest
+         (Mesa 25.2, env -i): unset -> llvmpipe, d3d12 -> GPU, llvmpipe -> software;
+         MESA_LOADER_DRIVER_OVERRIDE was inert in all four combinations, and
+         MESA_D3D12_DEFAULT_ADAPTER_NAME is what keeps d3d12 off the wrong GPU
+         (without it the guest lands on the integrated GPU, not the discrete GPU).
+      2. Never export LD_LIBRARY_PATH=/usr/lib/wsl/lib. -Stage Guest already writes
+         /etc/ld.so.conf.d/ld.wsl.conf + ldconfig, which covers CUDA/nvidia-smi. Adding
+         LD_LIBRARY_PATH on top only shadows system libraries and poisons GNOME/X11.
+         (/etc/profile.d is also the wrong scope - the graphical session never reads it.)
+
+    Elevation: only the Hyper-V stages (All / GpuPv / Undo) need an elevated PowerShell
+    and -VMName. Ssh / Drivers / Guest / Env / Verify are guest-side (ssh + scp) and run
+    from a normal shell.
 #>
 
 [CmdletBinding()]
@@ -55,13 +126,87 @@ param(
     [string]$VMName,
     [string]$GuestUser = 'ubuntu',
     [string]$GuestIP   = '10.0.0.5',
-    [ValidateSet('All', 'GpuPv', 'Drivers', 'Guest', 'Verify', 'Undo', 'Ssh')]
+    [int]$GuestPort    = 22,
+    [ValidateSet('All', 'GpuPv', 'Drivers', 'Guest', 'Env', 'Verify', 'Undo', 'Ssh')]
     [string]$Stage     = 'All',
+    [string[]]$Gpu     = @(),
+    [ValidateSet('Software', 'Gpu')]
+    [string]$DesktopRendering = 'Software',
+    [string[]]$DesktopApp = @(),
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Guest-side stages (Ssh / Drivers / Guest / Env / Verify) reach the guest over SSH, and
+# that does not have to be the LAN address: any routable "host -p port" works, e.g.
+# -GuestIP myguest.example.com -GuestPort 2222 through a port-forward, which is how you run the
+# env stage from outside the house. ssh takes -p, scp takes -P - hence two arrays.
 $SshOpts = @('-o', 'StrictHostKeyChecking=accept-new')
+$ScpOpts = @('-o', 'StrictHostKeyChecking=accept-new')
+if ($GuestPort -ne 22) {
+    $SshOpts += @('-p', "$GuestPort")
+    $ScpOpts += @('-P', "$GuestPort")
+}
+
+
+# ============================ Guest environment variables ============================
+# Single source of truth for the GPU-PV Mesa/D3D12 variables. Everything below
+# (/etc/environment, ~/.zshenv, startwm.sh, the .desktop prefix and the Verify probes)
+# renders from these two tables - so a variable can never be missing in one place only.
+#
+# What each variable actually does (measured on Mesa 25.2, Ubuntu 24.04 guest, env -i):
+#   GALLIUM_DRIVER                   the driver selector, and the only one that matters:
+#                                    d3d12 = GPU, llvmpipe = software, UNSET = Mesa default
+#                                    (which is llvmpipe on a GPU-PV guest).
+#   MESA_D3D12_DEFAULT_ADAPTER_NAME  picks WHICH GPU the d3d12 driver drives. Without it
+#                                    d3d12 silently lands on another adapter - on this
+#                                    host the integrated GPU instead of the discrete GPU.
+#   MESA_LOADER_DRIVER_OVERRIDE      no observable effect on Mesa 25.2 (swrast / d3d12 /
+#                                    unset all behave identically). Kept because older
+#                                    and newer loaders do consult it; harmless here.
+#   LIBVA_DRIVER_NAME                VA-API backend selection (d3d12_drv_video.so).
+#
+# A common misreading: "the two Mesa vars must be a pair or it falls back to llvmpipe".
+# Not what happens - the fallback comes from leaving GALLIUM_DRIVER unset. Keep the
+# variables below consistent anyway; that is what the health check verifies.
+$GpuEnv = [ordered]@{
+    GALLIUM_DRIVER                  = 'd3d12'
+    MESA_LOADER_DRIVER_OVERRIDE     = 'd3d12'
+    MESA_D3D12_DEFAULT_ADAPTER_NAME = 'NVIDIA'
+    LIBVA_DRIVER_NAME               = 'd3d12'
+}
+# Desktop session override: software rendering. The xorgxrdp framebuffer is in CPU
+# memory, so a GPU-composited desktop pays a VMbus read-back per frame before xrdp can
+# encode - pure overhead for drag-heavy work. Measured faster than d3d12 on this setup.
+$SwEnv = [ordered]@{
+    GALLIUM_DRIVER              = 'llvmpipe'
+    MESA_LOADER_DRIVER_OVERRIDE = 'swrast'
+}
+
+$envInline   = (($GpuEnv.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')
+$envShExport = (($GpuEnv.GetEnumerator() | ForEach-Object { "export $($_.Key)=$($_.Value)" }) -join "`n")
+$envPamLines = (($GpuEnv.GetEnumerator() | ForEach-Object { "$($_.Key)=`"$($_.Value)`"" }) -join "`n")
+$swShExport  = (($SwEnv.GetEnumerator() | ForEach-Object { "export $($_.Key)=$($_.Value)" }) -join "`n")
+$envAppList  = ($DesktopApp -join ' ')
+$envKeyRegex = '^(export[[:space:]]+)?(' +
+    (((@($GpuEnv.Keys) + @($SwEnv.Keys)) | Select-Object -Unique) -join '|') + ')='
+
+# Block bodies. The guest script adds the BEGIN/END markers; comments live here so there
+# is exactly one copy of the reasoning, next to the values it explains.
+$envZshBlock = @"
+# 从【桌面终端】里启动的程序继承的是 gnome-shell 的环境，而桌面会话被 startwm.sh
+# 压成了 llvmpipe/swrast —— 这里覆盖回 d3d12，让终端里起的图形程序也走 GPU。
+$envShExport
+# 不在 .zshenv 里 export LD_LIBRARY_PATH（会遮蔽系统库、污染 GNOME/X11）
+"@
+
+$envStartwmBlock = @"
+# GPU-PV：桌面会话压回软件渲染。xrdp 的 shadow framebuffer 在 CPU 内存里，GPU 合成
+# 要跨 VMbus 把每帧读回来才能编码 —— 对拖窗这种高频小批次负载是纯开销（实测比 d3d12 流畅）。
+# 要改回 GPU：-DesktopRendering Gpu（会摘掉本块，桌面转而继承 /etc/environment 的 d3d12）。
+$swShExport
+"@
 
 
 # ============================ Output helpers ============================
@@ -79,13 +224,29 @@ function Confirm {
 
 # ============================ Prerequisites ============================
 
+function Test-IsAdmin {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Assert-Prerequisites {
+    param([switch]$NeedsHyperV)
+
     Step 'Prerequisites'
 
-    if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
-        throw 'Get-VM not found. Please enable the Hyper-V management tools.'
+    if ($NeedsHyperV) {
+        if (-not (Test-IsAdmin)) {
+            throw "Stage '$Stage' touches Hyper-V (Get-VM / Set-VM). Re-run it from an elevated PowerShell."
+        }
+        if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+            throw 'Get-VM not found. Please enable the Hyper-V management tools.'
+        }
+        Ok 'Hyper-V module available (elevated)'
     }
-    Ok 'Hyper-V module available'
+    else {
+        Ok "Stage '$Stage' is guest-side only - Hyper-V and elevation not required"
+    }
 
     foreach ($cmd in 'ssh', 'scp') {
         if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
@@ -160,7 +321,7 @@ function Stop-VmIfRunning {
 }
 
 function Invoke-GpuPvSetup {
-    param([string]$Name)
+    param([string]$Name, [string[]]$Gpu = @())
 
     Step "Stage 1 / Host GPU-PV for $Name"
     Stop-VmIfRunning $Name
@@ -172,11 +333,52 @@ function Invoke-GpuPvSetup {
     if ($gpus.Count -eq 0) {
         throw 'No partitionable GPU on the host, or the GPU does not support GPU-PV.'
     }
-    foreach ($g in $gpus) {
-        Write-Host "  Found partitionable GPU: $($g.Name)"
+
+    # ----- Pick GPU(s) -----
+    $selectedIdx = @()
+
+    if ($Gpu.Count -gt 0) {
+        # -Gpu parameter overrides: fuzzy match each name against the available list
+        foreach ($gn in $Gpu) {
+            $hit = -1
+            for ($i = 0; $i -lt $gpus.Count; $i++) {
+                if ($gpus[$i].Name -like "*$gn*") { $hit = $i; break }
+            }
+            if ($hit -lt 0) {
+                throw "GPU '$gn' not found. Available names:`n$($gpus | ForEach-Object { '  - ' + $_.Name } | Out-String)"
+            }
+            $selectedIdx += $hit
+        }
+        Write-Host "  -Gpu 指定: $($Gpu -join ', ')"
+    }
+    elseif ($gpus.Count -eq 1 -or $Force) {
+        $selectedIdx = @(0..($gpus.Count - 1))
+        Write-Host "  Force / single GPU mode: auto-selected all $($gpus.Count) GPU(s)"
+    }
+    else {
+        Write-Host "  Available partitionable GPUs:" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $gpus.Count; $i++) {
+            Write-Host ('    [{0,2}] {1}' -f ($i + 1), $gpus[$i].Name)
+        }
+        Write-Host "    [A] All"
+        $pick = Read-Host "  Pick GPU(s) [1-$($gpus.Count), comma-separated like 1,3, or A]"
+        if ([string]::IsNullOrWhiteSpace($pick) -or $pick -eq 'A' -or $pick -eq 'a') {
+            $selectedIdx = @(0..($gpus.Count - 1))
+        }
+        elseif ($pick -match '^\d+(,\d+)*$') {
+            $selectedIdx = @($pick.Split(',') | ForEach-Object { [int]$_ - 1 })
+        }
+        else {
+            throw "Invalid selection: '$pick'"
+        }
+    }
+
+    foreach ($idx in $selectedIdx) {
+        $g = $gpus[$idx]
+        Write-Host "  Adding GPU partition adapter: $($g.Name)"
         Add-VMGpuPartitionAdapter -VMName $Name -InstancePath $g.Name
     }
-    Ok "Added $($gpus.Count) GPU partition adapter(s)"
+    Ok "Added $($selectedIdx.Count) GPU partition adapter(s)"
 
     Set-VMGpuPartitionAdapter -VMName $Name `
         -MinPartitionVRAM    1 -MaxPartitionVRAM    900000000            -OptimalPartitionVRAM    900000000 `
@@ -222,9 +424,9 @@ function Test-SshSetup {
     Step "SSH diagnostics: $User@$IP"
 
     # 1) Network layer
-    $nc = Test-NetConnection -ComputerName $IP -Port 22 -WarningAction SilentlyContinue
+    $nc = Test-NetConnection -ComputerName $IP -Port $GuestPort -WarningAction SilentlyContinue
     if (-not $nc.TcpTestSucceeded) {
-        Err "$IP:22 unreachable at the network layer"
+        Err "${IP}:${GuestPort} unreachable at the network layer"
         throw @"
   1) Is the guest powered on? (check the Hyper-V console / RDP into it)
   2) Is the SSH service running inside the guest?
@@ -233,10 +435,10 @@ function Test-SshSetup {
   3) Are the host and guest on the same subnet?
        Run ipconfig and compare the vEthernet(bridge) IP with $IP
   4) Firewall?
-       New-NetFirewallRule -DisplayName "SSH" -Direction Inbound -LocalPort 22 -Protocol TCP -Action Allow
+       New-NetFirewallRule -DisplayName "SSH" -Direction Inbound -LocalPort $GuestPort -Protocol TCP -Action Allow
 "@
     }
-    Ok "$IP:22 TCP reachable (RTT $($nc.NlatRoundTripTime) ms from $($nc.SourceAddress))"
+    Ok "${IP}:${GuestPort} TCP reachable (resolved to $($nc.RemoteAddress))"
 
     # 2) Local private key
     $sshDir = "$env:USERPROFILE\.ssh"
@@ -261,7 +463,9 @@ function Test-SshSetup {
     Ok "Found private key(s): $($privKeys -join ', ')"
 
     # 3) Actual login test (BatchMode forces key-only auth)
-    $sshOut = ssh @SshOpts -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 $IP 'echo SshOk' 2>&1
+    #    Must go through "${User}@${IP}" - without the user, ssh would try the current
+    #    Windows account on the guest and fail with Permission denied (publickey).
+    $sshOut = ssh @SshOpts -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 "${User}@${IP}" 'echo SshOk' 2>&1
     if ($LASTEXITCODE -eq 0 -and ($sshOut -match 'SshOk')) {
         Ok 'SSH key authentication succeeded, password-less'
         return
@@ -302,7 +506,7 @@ function Test-SshSetup {
     } elseif ($sshOut -match 'Connection (timed out|reset)') {
         $help = @"
   Network-layer failure. Check:
-    Test-NetConnection -ComputerName $IP -Port 22
+    Test-NetConnection -ComputerName $IP -Port $GuestPort
     (RDP in) sudo ss -tln | grep :22
 "@
     } elseif ($sshOut -match 'No route') {
@@ -358,10 +562,10 @@ function Copy-DriverFiles {
     & ssh @SshOpts "${User}@${IP}" 'mkdir -p ~/wsl/lib ~/wsl/drivers'
     foreach ($d in $storeDirs) {
         Write-Host "  scp $d ..."
-        & scp -r @SshOpts $d "${User}@${IP}:~/wsl/drivers/"
+        & scp -r @ScpOpts $d "${User}@${IP}:~/wsl/drivers/"
     }
-    if (Test-Path $lxss)   { & scp -r @SshOpts $lxss   "${User}@${IP}:~/wsl/lib/" }
-    if (Test-Path $wslLib) { & scp -r @SshOpts $wslLib "${User}@${IP}:~/wsl/lib/" }
+    if (Test-Path $lxss)   { & scp -r @ScpOpts $lxss   "${User}@${IP}:~/wsl/lib/" }
+    if (Test-Path $wslLib) { & scp -r @ScpOpts $wslLib "${User}@${IP}:~/wsl/lib/" }
 
     Ok 'Drivers copied'
 }
@@ -396,20 +600,32 @@ echo "      6.6-6.17 -> linux-msft-wsl-6.6.y    (patches 0001 + 0002-Fix-eventfd
 echo "      6.18+    -> linux-msft-wsl-6.18.y   (patches 0001)"
 echo "      Current kernel $(uname -r) will be routed automatically."
 
-# Hardening git against HTTP proxy long-connection drops
-git config --global http.postBuffer 524288000
-git config --global http.lowSpeedLimit 1000
-git config --global http.lowSpeedTime 600
-git config --global http.version HTTP/1.1
+# Force HTTP proxy for curl / git / apt (raw.githubusercontent.com + microsoft kernel need it)
+# Note: VM-side persistence (git config http.proxy, /etc/sudoers.d/99-gpupv-proxy env_keep,
+# ~/.bashrc export) is already in place. We only need to set PROXY_URL here so the bash
+# subprocess below has the proxy in env, which sudo will then inherit via the sudoers drop-in.
+PROXY_URL="http://proxy.example.com:3128"
+NO_PROXY="localhost,127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,*.local"
+export http_proxy="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export HTTP_PROXY="$PROXY_URL"
+export HTTPS_PROXY="$PROXY_URL"
+export no_proxy="$NO_PROXY"
+export NO_PROXY="$NO_PROXY"
+echo "  Proxy: $PROXY_URL"
 
 # Pull install.sh locally, then patch two things before running:
 #   1. git clone gets --filter=blob:none (microsoft/WSL2-Linux-Kernel is huge, breaks through proxies)
 #   2. patch URLs go through raw.githubusercontent.com (adds retry + timeouts)
-curl -fsSL --max-time 60 --retry 5 \
-    https://content.staralt.dev/dxgkrnl-dkms/main/install.sh -o /tmp/install.sh
+curl -fsSL --max-time 60 --retry 5 --proxy "$PROXY_URL" \
+    https://raw.githubusercontent.com/staralt/dxgkrnl-dkms/main/install.sh -o /tmp/install.sh
 chmod +x /tmp/install.sh
 sed -i 's|git clone --branch=|git clone --filter=blob:none --branch=|'   /tmp/install.sh
 sed -i 's|https://content.staralt.dev/dxgkrnl-dkms/main|https://raw.githubusercontent.com/staralt/dxgkrnl-dkms/main|g' /tmp/install.sh
+# Force every curl inside install.sh to use the proxy too (defense in depth against
+# sudo env_reset stripping http_proxy). Use double quotes so bash expands $PROXY_URL
+# at substitution time -- install.sh doesn't see PROXY_URL when it runs.
+sed -i "s|curl -fsSL|curl -fsSL --proxy ${PROXY_URL}|g" /tmp/install.sh
 sudo /tmp/install.sh
 
 echo ""
@@ -499,7 +715,7 @@ function Invoke-GuestSetup {
     [IO.File]::WriteAllText($tmp, ($guestSetupBash -replace "`r`n", "`n"))
 
     Write-Host '  Uploading the guest install script...'
-    & scp @SshOpts $tmp "${User}@${IP}:~/gpupv-guest-setup.sh"
+    & scp @ScpOpts $tmp "${User}@${IP}:~/gpupv-guest-setup.sh"
 
     Write-Host '  Executing it on the guest (sudo may prompt for a password)...'
     & ssh -t @SshOpts "${User}@${IP}" 'sudo bash ~/gpupv-guest-setup.sh'
@@ -508,10 +724,206 @@ function Invoke-GuestSetup {
 }
 
 
+# ============================ Stage Env / Guest environment variables ============================
+
+$envSetupBash = @'
+#!/bin/bash
+set -euo pipefail
+
+# Runs via sudo, so $HOME is /root - resolve the real user's home from SUDO_USER.
+if [ -n "${SUDO_USER:-}" ]; then
+    UHOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    UUID_="$(id -u "$SUDO_USER")"
+    UGID="$(id -g "$SUDO_USER")"
+else
+    UHOME="$HOME"
+    UUID_="$(id -u)"
+    UGID="$(id -g)"
+fi
+echo ">>> User home dir: $UHOME"
+
+BEGIN="# >>> gpupv-env BEGIN (managed by ubuntu-gpu-pv.ps1 - do not edit inside) >>>"
+END="# <<< gpupv-env END <<<"
+KEYRE='@@KEYRE@@'
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+# Idempotent block writer.
+#   upsert_block <file> <append|after-shebang|remove> <root|user>   (block body on stdin)
+# Drops the previous managed block, folds any stray unmanaged definitions of the same
+# keys into the block (so the script stays the single source of truth), then writes it.
+# after-shebang is used for startwm.sh: the vars must be set before the session starts,
+# and appending after its final `exit` would silently do nothing.
+upsert_block() {
+    local file="$1" mode="$2" owner="${3:-root}"
+    local block body out
+
+    block="$(mktemp)"
+    body="$(mktemp)"
+    out="$(mktemp)"
+
+    if [ "$mode" != "remove" ]; then
+        { printf '%s\n' "$BEGIN"; cat; printf '%s\n' "$END"; } > "$block"
+    fi
+
+    if [ -f "$file" ]; then
+        awk -v b="$BEGIN" -v e="$END" -v re="$KEYRE" '
+            $0 == b { skip = 1; next }
+            $0 == e { skip = 0; next }
+            skip    { next }
+            $0 ~ re { next }
+            { print }
+        ' "$file" > "$body"
+    else
+        : > "$body"
+    fi
+
+    case "$mode" in
+    append)
+        cat "$body" > "$out"
+        if [ -s "$block" ]; then cat "$block" >> "$out"; fi
+        ;;
+    after-shebang)
+        if head -1 "$body" | grep -q '^#!'; then
+            head -1 "$body" > "$out"
+            if [ -s "$block" ]; then cat "$block" >> "$out"; fi
+            tail -n +2 "$body" >> "$out"
+        else
+            if [ -s "$block" ]; then cat "$block" >> "$out"; fi
+            cat "$body" >> "$out"
+        fi
+        ;;
+    remove)
+        cat "$body" > "$out"
+        ;;
+    esac
+
+    if [ -f "$file" ] && cmp -s "$out" "$file"; then
+        echo "  [=]  $file (unchanged)"
+        rm -f "$block" "$body" "$out"
+        return 0
+    fi
+
+    if [ -f "$file" ]; then cp -a "$file" "$file.bak-$STAMP"; fi
+    install -m 0644 "$out" "$file"
+    if [ "$owner" = "user" ]; then chown "$UUID_:$UGID" "$file"; else chown root:root "$file"; fi
+    rm -f "$block" "$body" "$out"
+    echo "  [OK] $file updated"
+}
+
+echo ""
+echo ">>> [Env 1/4] /etc/environment - PAM (pam_env readenv=1): SSH sessions + systemd services"
+upsert_block /etc/environment append root <<'EOF'
+@@ENVPAM@@
+EOF
+
+echo ""
+echo ">>> [Env 2/4] ~/.zshenv - terminal started inside the desktop"
+upsert_block "$UHOME/.zshenv" append user <<'EOF'
+@@ENVZSH@@
+EOF
+
+echo ""
+echo ">>> [Env 3/4] /etc/xrdp/startwm.sh - the desktop session only"
+if [ "@@DESKTOPMODE@@" = "Software" ]; then
+    upsert_block /etc/xrdp/startwm.sh after-shebang root <<'EOF'
+@@ENVSTARTWM@@
+EOF
+    echo "  -> desktop session pinned to llvmpipe/swrast"
+else
+    upsert_block /etc/xrdp/startwm.sh remove root
+    echo "  -> no override; the session inherits d3d12 from /etc/environment"
+fi
+
+echo ""
+echo ">>> [Env 4/4] dock apps - .desktop clone with the GPU env prefix on Exec="
+if [ -z "@@APPS@@" ]; then
+    echo "  [--] no -DesktopApp given, skipped"
+    echo "       (e.g. -DesktopApp 'com.microsoft.Edge.desktop')"
+else
+    mkdir -p "$UHOME/.local/share/applications"
+    for app in @@APPS@@; do
+        src="/usr/share/applications/$app"
+        dst="$UHOME/.local/share/applications/$app"
+
+        if [ ! -f "$src" ]; then
+            echo "  [!]  $app: $src not found, skipped"
+            continue
+        fi
+        if [ ! -f "$dst" ]; then
+            cp "$src" "$dst"
+            chown "$UUID_:$UGID" "$dst"
+        fi
+        if grep -q '^Exec=env GALLIUM_DRIVER=' "$dst"; then
+            echo "  [=]  $app already prefixed"
+            continue
+        fi
+
+        cp -a "$dst" "$dst.bak-$STAMP"
+        sed -i "s|^Exec=|Exec=env @@ENVINLINE@@ |" "$dst"
+        chown "$UUID_:$UGID" "$dst"
+        echo "  [OK] $app: Exec= prefixed"
+    done
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$UHOME/.local/share/applications" 2>/dev/null || true
+    fi
+fi
+
+echo ""
+echo ">>> Self-check"
+for f in /etc/environment "$UHOME/.zshenv" /etc/xrdp/startwm.sh; do
+    if [ -f "$f" ]; then
+        n="$(grep -cE "$KEYRE" "$f" || true)"
+        echo "  $f: $n managed definition(s)"
+    fi
+done
+
+GS="$(pgrep -x gnome-shell 2>/dev/null | head -1 || true)"
+if [ -n "$GS" ]; then
+    echo "  gnome-shell($GS) currently has (still the old session - log out to pick up changes):"
+    tr '\0' '\n' < "/proc/$GS/environ" \
+        | grep -E '^(GALLIUM_DRIVER|MESA_LOADER_DRIVER_OVERRIDE)=' | sed 's/^/      /'
+fi
+echo ""
+echo "DONE - environment variables deployed"
+'@
+
+function Invoke-EnvSetup {
+    param([string]$User, [string]$IP, [string]$Rendering, [string[]]$Apps)
+
+    Step 'Stage Env / Guest environment variables'
+
+    $script = $envSetupBash
+    $script = $script.Replace('@@ENVPAM@@',      $envPamLines)
+    $script = $script.Replace('@@ENVZSH@@',      $envZshBlock)
+    $script = $script.Replace('@@ENVSTARTWM@@',  $envStartwmBlock)
+    $script = $script.Replace('@@ENVINLINE@@',   $envInline)
+    $script = $script.Replace('@@KEYRE@@',       $envKeyRegex)
+    $script = $script.Replace('@@DESKTOPMODE@@', $Rendering)
+    $script = $script.Replace('@@APPS@@',        ($Apps -join ' '))
+
+    $tmp = Join-Path $env:TEMP 'gpupv-env-setup.sh'
+    [IO.File]::WriteAllText($tmp, ($script -replace "`r`n", "`n"))
+
+    Write-Host '  Uploading the env script...'
+    & scp @ScpOpts $tmp "${User}@${IP}:~/gpupv-env-setup.sh"
+
+    Write-Host '  Applying it on the guest (sudo)...'
+    & ssh -t @SshOpts "${User}@${IP}" 'sudo bash ~/gpupv-env-setup.sh'
+
+    Ok 'Environment variables deployed'
+}
+
+
 # ============================ Verify ============================
 
 $verifyBash = @'
 set -u
+
+# The probes below MUST run with the full variable set: GALLIUM_DRIVER alone makes Mesa
+# fall back to llvmpipe silently, so a probe without the matching override would report
+# a "pass" for a config that does not actually use D3D12. Same source of truth as Env.
+ENV_INLINE='@@ENVINLINE@@'
 
 echo "--- Kernel modules ---"
 lsmod 2>/dev/null | grep -E "dxgkrnl|vgem" || echo "  dxgkrnl / vgem not found"
@@ -530,15 +942,23 @@ LD_LIBRARY_PATH=/usr/lib/wsl/lib /usr/lib/wsl/lib/nvidia-smi 2>&1 | head -15 || 
 
 echo
 echo "--- D3D12 renderer (OpenGL) ---"
-GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
-    eglinfo -B 2>/dev/null | grep -iE "d3d12|device|adapter" | head -8 \
+env $ENV_INLINE eglinfo -B 2>/dev/null | grep -iE "d3d12|device|adapter" | head -8 \
     || echo "  No D3D12: apt install mesa-utils"
 
 echo
 echo "--- VAAPI (D3D12 backend) ---"
 if command -v vainfo >/dev/null 2>&1; then
-    LIBVA_DRIVER_NAME=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
-        vainfo 2>/dev/null | sed -n '1,20p' || echo "  vainfo failed"
+    # Prefer the DRM path: it reaches the actual driver (and reports "drv_video.so init
+    # failed" when the backend is broken), whereas a plain `vainfo` over SSH only says
+    # "can't connect to X server". Informational either way - the GL/EGL probe above is
+    # what the desktop really uses.
+    CARD="$(ls /dev/dri/card* 2>/dev/null | head -1)"
+    if [ -n "$CARD" ]; then
+        env $ENV_INLINE vainfo --display drm --device "$CARD" 2>&1 | sed -n '1,10p' | sed 's/^/    /'
+    else
+        env $ENV_INLINE vainfo 2>&1 | sed -n '1,10p' | sed 's/^/    /'
+    fi
+    echo "    (informational: a failure here is expected on some GPU-PV stacks)"
 else
     echo "  vainfo not installed (apt install mesa-va-drivers vainfo)"
 fi
@@ -546,12 +966,82 @@ fi
 echo
 echo "--- Vulkan (D3D12 device) ---"
 if command -v vulkaninfo >/dev/null 2>&1; then
-    MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA vulkaninfo --summary 2>&1 \
-        | grep -iE "deviceName|apiVersion|driverName" | head -8 \
+    env $ENV_INLINE vulkaninfo --summary 2>&1 \
+        | grep -iE "deviceName|apiVersion|driverName" | head -8 | sed 's/^/    /' \
         || echo "  No D3D12 adapter"
+    echo "    (llvmpipe here = no D3D12 Vulkan ICD selected; the desktop path is EGL/GL, above)"
 else
     echo "  vulkaninfo not installed (apt install vulkan-tools)"
 fi
+
+echo
+echo "================= Environment health check ================="
+echo "  Measured behaviour on this stack (Mesa 25.2, 2026-10-12):"
+echo "    GALLIUM_DRIVER                   d3d12 = GPU / llvmpipe = software / UNSET = Mesa"
+echo "                                     default, which is llvmpipe on a GPU-PV guest"
+echo "    MESA_D3D12_DEFAULT_ADAPTER_NAME  which GPU d3d12 drives; without it Mesa lands on"
+echo "                                     another adapter (the integrated GPU here)"
+echo "    MESA_LOADER_DRIVER_OVERRIDE      no observable effect (swrast/d3d12/unset identical)"
+echo
+
+interpret() {
+    local label="$1" gallium="$2" adapter="$3"
+    case "${gallium:-}" in
+    d3d12)
+        if [ -n "${adapter:-}" ]; then
+            echo "  [OK]  $label: GPU via d3d12 (adapter preference: $adapter)"
+        else
+            echo "  [!]   $label: d3d12 but no MESA_D3D12_DEFAULT_ADAPTER_NAME"
+            echo "        -> Mesa may drive a different GPU than the one you want"
+        fi ;;
+    llvmpipe)
+        echo "  [OK]  $label: software rendering (GALLIUM_DRIVER=llvmpipe)" ;;
+    '')
+        echo "  [--]  $label: GALLIUM_DRIVER unset -> Mesa default (llvmpipe here)" ;;
+    *)
+        echo "  [OK]  $label: GALLIUM_DRIVER=$gallium" ;;
+    esac
+}
+
+# Last definition wins in both /etc/environment and shell rc files.
+read_var() {
+    if [ -f "$1" ]; then
+        sed -n "s/^\(export[[:space:]]*\)\?$2=//p" "$1" | tr -d '"' | tail -1
+    fi
+}
+
+echo "[1] /etc/environment        (PAM -> SSH sessions + systemd services)"
+interpret "/etc/environment" "$(read_var /etc/environment GALLIUM_DRIVER)" \
+                             "$(read_var /etc/environment MESA_D3D12_DEFAULT_ADAPTER_NAME)"
+
+echo "[2] ${HOME}/.zshenv         (terminal started inside the desktop)"
+interpret "~/.zshenv" "$(read_var "$HOME/.zshenv" GALLIUM_DRIVER)" \
+                      "$(read_var "$HOME/.zshenv" MESA_D3D12_DEFAULT_ADAPTER_NAME)"
+
+echo "[3] /etc/xrdp/startwm.sh    (desktop session override; unset = inherit /etc/environment)"
+interpret "startwm.sh" "$(read_var /etc/xrdp/startwm.sh GALLIUM_DRIVER)" \
+                       "$(read_var /etc/xrdp/startwm.sh MESA_D3D12_DEFAULT_ADAPTER_NAME)"
+
+echo "[4] live desktop process    (the truth for the current session)"
+GS="$(pgrep -x gnome-shell 2>/dev/null | head -1)"
+if [ -n "$GS" ]; then
+    interpret "gnome-shell($GS)" \
+        "$(tr '\0' '\n' < "/proc/$GS/environ" | sed -n 's/^GALLIUM_DRIVER=//p')" \
+        "$(tr '\0' '\n' < "/proc/$GS/environ" | sed -n 's/^MESA_D3D12_DEFAULT_ADAPTER_NAME=//p')"
+    echo "        /dev/dxg handles held = $(ls -l "/proc/$GS/fd" 2>/dev/null | grep -c dxg) (0 for software)"
+else
+    echo "  [--]  no gnome-shell running (no desktop session)"
+fi
+
+echo "[5] who holds /dev/dxg      (own-user processes only; sudo for the full list)"
+DXG_FOUND=0
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+    if ls -l "/proc/$pid/fd" 2>/dev/null | grep -q dxg; then
+        echo "        pid $pid  $(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+        DXG_FOUND=1
+    fi
+done
+if [ "$DXG_FOUND" -eq 0 ]; then echo "        (none)"; fi
 
 echo
 echo "DONE"
@@ -560,12 +1050,14 @@ echo "DONE"
 function Test-GpuPv {
     param([string]$User, [string]$IP)
 
-    Step "Stage 4 / Verify $User@$IP"
+    Step "Stage Verify / $User@$IP"
+
+    $script = $verifyBash.Replace('@@ENVINLINE@@', $envInline)
 
     $tmp = Join-Path $env:TEMP 'gpupv-verify.sh'
-    [IO.File]::WriteAllText($tmp, ($verifyBash -replace "`r`n", "`n"))
+    [IO.File]::WriteAllText($tmp, ($script -replace "`r`n", "`n"))
 
-    & scp @SshOpts $tmp "${User}@${IP}:~/gpupv-verify.sh"
+    & scp @ScpOpts $tmp "${User}@${IP}:~/gpupv-verify.sh"
     & ssh @SshOpts "${User}@${IP}" 'bash ~/gpupv-verify.sh'
 }
 
@@ -584,16 +1076,28 @@ function Undo-GpuPv {
     Warn 'In-guest artifacts are NOT cleaned up by this step - handle them manually if needed:'
     Write-Host '    sudo rm -rf /usr/lib/wsl /etc/ld.so.conf.d/ld.wsl.conf && sudo ldconfig'
     Write-Host '    sudo /usr/lib/wsl/../dxgkrnl-dkms/install.sh clean all   # if install.sh is still around'
+    Write-Host '    # -Stage Env 写的受管块（三处，连带 BEGIN/END 标记一起删）：'
+    Write-Host '    sudo sed -i "/gpupv-env BEGIN/,/gpupv-env END/d" /etc/environment /etc/xrdp/startwm.sh'
+    Write-Host '    sed -i "/gpupv-env BEGIN/,/gpupv-env END/d" ~/.zshenv'
+    Write-Host '    # 各文件旁边还留了 .bak-<时间戳> 备份，可直接还原'
 }
 
 
 # ============================ Main flow ============================
 
-Assert-Prerequisites
-$vmName = (Resolve-VM $VMName).Name
+# The VM is only needed by the Hyper-V stages (GpuPv / Undo). Guest-side stages
+# (Ssh / Drivers / Guest / Env / Verify) talk to the guest over SSH only - resolving
+# the VM there would need Hyper-V and a -VMName for no reason.
+function Resolve-VmNameIfNeeded {
+    if ($Stage -in 'GpuPv', 'Undo', 'All') { return (Resolve-VM $VMName).Name }
+    return $null
+}
+
+Assert-Prerequisites -NeedsHyperV:($Stage -in 'GpuPv', 'Undo', 'All')
+$vmName = Resolve-VmNameIfNeeded
 
 switch ($Stage) {
-    'GpuPv'   { Invoke-GpuPvSetup $vmName }
+    'GpuPv'   { Invoke-GpuPvSetup $vmName $Gpu }
     'Ssh'     { Test-SshSetup     $GuestUser $GuestIP }
     'Drivers' {
         Test-SshSetup   $GuestUser $GuestIP
@@ -603,31 +1107,42 @@ switch ($Stage) {
         Test-SshSetup    $GuestUser $GuestIP
         Invoke-GuestSetup $GuestUser $GuestIP
     }
+    'Env'     {
+        Test-SshSetup    $GuestUser $GuestIP
+        Invoke-EnvSetup   $GuestUser $GuestIP $DesktopRendering $DesktopApp
+    }
     'Verify'  {
         Test-SshSetup    $GuestUser $GuestIP
         Test-GpuPv        $GuestUser $GuestIP
     }
     'Undo'    { Undo-GpuPv        $vmName }
     'All'     {
-        Invoke-GpuPvSetup $vmName
-        Wait-GuestOnline  $GuestIP
+        Invoke-GpuPvSetup $vmName $Gpu
+        Wait-GuestOnline  $GuestIP -Port $GuestPort
         Test-SshSetup     $GuestUser $GuestIP
         Copy-DriverFiles  $vmName $GuestUser $GuestIP
         Invoke-GuestSetup $GuestUser $GuestIP
+        Invoke-EnvSetup   $GuestUser $GuestIP $DesktopRendering $DesktopApp
         Test-GpuPv        $GuestUser $GuestIP
     }
 }
 
 Write-Host ''
 Write-Host '============================ All done ============================' -ForegroundColor Green
-Write-Host 'Optional follow-up (graphics + desktop):'
-Write-Host '  1) On the guest install tooling: sudo apt install -y vainfo mesa-utils mesa-vulkan-drivers mesa-va-drivers vulkan-tools'
-Write-Host '  2) Place in /etc/profile.d/gpupv.sh (DO NOT export LD_LIBRARY_PATH here - it poisons GNOME/X11):'
-Write-Host '       export GALLIUM_DRIVER=d3d12'
-Write-Host '       export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA'
-Write-Host '       export LIBVA_DRIVER_NAME=d3d12'
-Write-Host '       export MESA_LOADER_DRIVER_OVERRIDE=vgem'
-Write-Host '       export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH'
+Write-Host 'Optional follow-up:'
+Write-Host '  1) Guest tooling: sudo apt install -y vainfo mesa-utils mesa-vulkan-drivers mesa-va-drivers vulkan-tools'
+Write-Host '  2) Environment variables were deployed by -Stage Env (idempotent marker block):'
+Write-Host '       /etc/environment      -> d3d12            (PAM: SSH sessions + systemd services)'
+Write-Host '       ~/.zshenv             -> d3d12            (terminal inside the desktop)'
+Write-Host "       /etc/xrdp/startwm.sh  -> llvmpipe/swrast  (desktop session only; -DesktopRendering Gpu to drop it)"
+Write-Host '       ~/.local/share/applications/*.desktop      -> d3d12 (dock apps; -DesktopApp <name.desktop>)'
+Write-Host '       Re-run any time: .\ubuntu-gpu-pv.ps1 -Stage Env -VMName <vm>; -Stage Verify to health-check.'
+Write-Host '     * Never export LD_LIBRARY_PATH=/usr/lib/wsl/lib: -Stage Guest already writes'
+Write-Host '       /etc/ld.so.conf.d/ld.wsl.conf + ldconfig. Adding it on top only shadows system'
+Write-Host '       libs and poisons GNOME/X11 - and /etc/profile.d is never read by a GUI session.'
+Write-Host '     * GALLIUM_DRIVER is the switch (d3d12 = GPU, llvmpipe = software). Leaving it'
+Write-Host '       UNSET is what causes a silent llvmpipe fallback - and d3d12 without'
+Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (the integrated GPU here).'
 Write-Host '  3) Recommended desktop: GNOME on Ubuntu 24.04+. On 22.04 mutter crashes in this stack;'
 Write-Host '     use LXQt / Xfce instead, or upgrade the guest to 24.04 where the fix is upstream.'
 Write-Host ''
