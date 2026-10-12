@@ -156,23 +156,27 @@ if ($GuestPort -ne 22) {
 # renders from these two tables - so a variable can never be missing in one place only.
 #
 # What each variable actually does (measured on Mesa 25.2, Ubuntu 24.04 guest, env -i):
-#   GALLIUM_DRIVER                   the driver selector, and the only one that matters:
-#                                    d3d12 = GPU, llvmpipe = software, UNSET = Mesa default
-#                                    (which is llvmpipe on a GPU-PV guest).
+#   GALLIUM_DRIVER                   the driver selector: d3d12 = GPU, llvmpipe = software,
+#                                    UNSET = Mesa default (which is llvmpipe on a GPU-PV guest).
+#                                    VA-API needs d3d12 here too, not just LIBVA_DRIVER_NAME.
 #   MESA_D3D12_DEFAULT_ADAPTER_NAME  picks WHICH GPU the d3d12 driver drives. Without it
-#                                    d3d12 silently lands on another adapter - on this
+#                                    d3d12 can silently land on another adapter - on this
 #                                    host the integrated GPU instead of the discrete GPU.
-#   MESA_LOADER_DRIVER_OVERRIDE      no observable effect on Mesa 25.2 (swrast / d3d12 /
-#                                    unset all behave identically). Kept because older
-#                                    and newer loaders do consult it; harmless here.
+#   MESA_LOADER_DRIVER_OVERRIDE      inert for GL, but LOAD-BEARING for VA-API: only 'vgem'
+#                                    initialises the VA d3d12 frontend (it binds the vgem
+#                                    DRM device). 'd3d12' and unset both die with
+#                                    "d3d12_drv_video.so init failed / resource allocation
+#                                    failed". Requires vgem to actually be loaded - see the
+#                                    Env/Verify stages. This is the ingredient the upstream
+#                                    README always had and that is easy to dismiss as folklore.
 #   LIBVA_DRIVER_NAME                VA-API backend selection (d3d12_drv_video.so).
 #
-# A common misreading: "the two Mesa vars must be a pair or it falls back to llvmpipe".
-# Not what happens - the fallback comes from leaving GALLIUM_DRIVER unset. Keep the
-# variables below consistent anyway; that is what the health check verifies.
+# Hardware video decoding therefore needs GALLIUM_DRIVER=d3d12 as well, which is why the
+# software-rendered desktop session (startwm.sh: llvmpipe) cannot do VA-API - apps that want
+# it must opt in per app (-DesktopApp) or from a terminal (~/.zshenv).
 $GpuEnv = [ordered]@{
     GALLIUM_DRIVER                  = 'd3d12'
-    MESA_LOADER_DRIVER_OVERRIDE     = 'd3d12'
+    MESA_LOADER_DRIVER_OVERRIDE     = 'vgem'
     MESA_D3D12_DEFAULT_ADAPTER_NAME = 'NVIDIA'
     LIBVA_DRIVER_NAME               = 'd3d12'
 }
@@ -840,8 +844,11 @@ if [ -z "@@APPS@@" ]; then
     echo "  [--] no -DesktopApp given, skipped"
     echo "       (e.g. -DesktopApp 'com.microsoft.Edge.desktop')"
 else
+    # Tolerate a comma-joined list too: `powershell -File script.ps1 -DesktopApp a,b`
+    # hands the whole thing over as one string.
+    APPS="$(printf '%s' "@@APPS@@" | tr ',' ' ')"
     mkdir -p "$UHOME/.local/share/applications"
-    for app in @@APPS@@; do
+    for app in $APPS; do
         src="/usr/share/applications/$app"
         dst="$UHOME/.local/share/applications/$app"
 
@@ -853,15 +860,26 @@ else
             cp "$src" "$dst"
             chown "$UUID_:$UGID" "$dst"
         fi
-        if grep -q '^Exec=env GALLIUM_DRIVER=' "$dst"; then
-            echo "  [=]  $app already prefixed"
+        PREFIX="env @@ENVINLINE@@ "
+
+        if grep -qF "Exec=$PREFIX" "$dst"; then
+            echo "  [=]  $app already carries the current values"
             continue
         fi
 
         cp -a "$dst" "$dst.bak-$STAMP"
-        sed -i "s|^Exec=|Exec=env @@ENVINLINE@@ |" "$dst"
+
+        if grep -q '^Exec=env ' "$dst"; then
+            # Already prefixed but with stale values (e.g. MESA_LOADER_DRIVER_OVERRIDE was
+            # d3d12 before vgem was needed) - swap the whole prefix, don't stack a second one.
+            sed -i -E "s|^Exec=env ([A-Za-z_][A-Za-z0-9_]*=[^ ]* )+|Exec=$PREFIX|" "$dst"
+            echo "  [OK] $app: prefix refreshed to the current values"
+        else
+            sed -i "s|^Exec=|Exec=$PREFIX|" "$dst"
+            echo "  [OK] $app: Exec= prefixed"
+        fi
+
         chown "$UUID_:$UGID" "$dst"
-        echo "  [OK] $app: Exec= prefixed"
     done
 
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -947,20 +965,32 @@ env $ENV_INLINE eglinfo -B 2>/dev/null | grep -iE "d3d12|device|adapter" | head 
 
 echo
 echo "--- VAAPI (D3D12 backend) ---"
-if command -v vainfo >/dev/null 2>&1; then
-    # Prefer the DRM path: it reaches the actual driver (and reports "drv_video.so init
-    # failed" when the backend is broken), whereas a plain `vainfo` over SSH only says
-    # "can't connect to X server". Informational either way - the GL/EGL probe above is
-    # what the desktop really uses.
-    CARD="$(ls /dev/dri/card* 2>/dev/null | head -1)"
-    if [ -n "$CARD" ]; then
-        env $ENV_INLINE vainfo --display drm --device "$CARD" 2>&1 | sed -n '1,10p' | sed 's/^/    /'
-    else
-        env $ENV_INLINE vainfo 2>&1 | sed -n '1,10p' | sed 's/^/    /'
-    fi
-    echo "    (informational: a failure here is expected on some GPU-PV stacks)"
-else
+if ! command -v vainfo >/dev/null 2>&1; then
     echo "  vainfo not installed (apt install mesa-va-drivers vainfo)"
+else
+    # $ENV_INLINE is exactly the known-good VA recipe (GALLIUM_DRIVER=d3d12 +
+    # MESA_LOADER_DRIVER_OVERRIDE=vgem + LIBVA_DRIVER_NAME=d3d12), so this is a real
+    # check rather than a formality. It also needs the vgem device to exist - if vgem is
+    # blacklisted or not loaded, no VA recipe works (see the health check below).
+    VA_CARD="$(ls /dev/dri/card* 2>/dev/null | head -1)"
+    VA_ARG=""
+    if [ -n "$VA_CARD" ]; then VA_ARG="--display drm --device $VA_CARD"; fi
+
+    VA_OUT="$(env $ENV_INLINE vainfo $VA_ARG 2>&1)"
+
+    if echo "$VA_OUT" | grep -q 'va_openDriver() returns 0'; then
+        echo "  [OK]  $(echo "$VA_OUT" | grep -o 'for D3D12 ([^)]*)' | head -1)"
+        echo "        decode entrypoints: $(echo "$VA_OUT" | grep -c VLD)   encode entrypoints: $(echo "$VA_OUT" | grep -c Enc)"
+    else
+        echo "  [!]   VA-API did not initialise:"
+        echo "$VA_OUT" | grep -E 'error|failed' | head -3 | sed 's/^/        /'
+        if lsmod | grep -q '^vgem'; then
+            echo "        -> vgem is loaded, so the three variables matter (all three are needed)"
+        else
+            echo "        -> vgem is NOT loaded. Load it (sudo modprobe vgem) and make sure no"
+            echo "           /etc/modprobe.d/blacklist-vgem.conf exists - VA needs the vgem device."
+        fi
+    fi
 fi
 
 echo
@@ -981,7 +1011,8 @@ echo "    GALLIUM_DRIVER                   d3d12 = GPU / llvmpipe = software / U
 echo "                                     default, which is llvmpipe on a GPU-PV guest"
 echo "    MESA_D3D12_DEFAULT_ADAPTER_NAME  which GPU d3d12 drives; without it Mesa lands on"
 echo "                                     another adapter (the integrated GPU here)"
-echo "    MESA_LOADER_DRIVER_OVERRIDE      no observable effect (swrast/d3d12/unset identical)"
+echo "    MESA_LOADER_DRIVER_OVERRIDE      inert for GL, but VA-API only initialises with"
+echo "                                     'vgem' (needs the vgem device to exist)"
 echo
 
 interpret() {
@@ -1042,6 +1073,17 @@ for pid in $(ls /proc | grep -E '^[0-9]+$'); do
     fi
 done
 if [ "$DXG_FOUND" -eq 0 ]; then echo "        (none)"; fi
+
+echo "[6] vgem device             (VA-API / hardware video needs it to exist)"
+if lsmod | grep -q '^vgem'; then
+    echo "  [OK]  vgem loaded; nodes: $(ls /dev/dri/card0 /dev/dri/renderD128 2>/dev/null | tr '\n' ' ')"
+else
+    echo "  [!]   vgem is NOT loaded -> no VA recipe can initialise."
+    if [ -f /etc/modprobe.d/blacklist-vgem.conf ]; then
+        echo "        blocked by /etc/modprobe.d/blacklist-vgem.conf (remove or rename it)"
+    fi
+    echo "        load it now: sudo modprobe vgem   (persist via /etc/modules-load.d)"
+fi
 
 echo
 echo "DONE"
@@ -1143,6 +1185,9 @@ Write-Host '       libs and poisons GNOME/X11 - and /etc/profile.d is never read
 Write-Host '     * GALLIUM_DRIVER is the switch (d3d12 = GPU, llvmpipe = software). Leaving it'
 Write-Host '       UNSET is what causes a silent llvmpipe fallback - and d3d12 without'
 Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (the integrated GPU here).'
+Write-Host '     * Hardware video (VA-API) needs THREE things at once: GALLIUM_DRIVER=d3d12,'
+Write-Host '       MESA_LOADER_DRIVER_OVERRIDE=vgem, and the vgem device loaded. The software-'
+Write-Host '       rendered desktop cannot have it - opt in per app (-DesktopApp) or a terminal.'
 Write-Host '  3) Recommended desktop: GNOME on Ubuntu 24.04+. On 22.04 mutter crashes in this stack;'
 Write-Host '     use LXQt / Xfce instead, or upgrade the guest to 24.04 where the fix is upstream.'
 Write-Host ''

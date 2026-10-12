@@ -36,6 +36,11 @@ export GST_VAAPI_DRM_DEVICE=/dev/dri/card0
 ```
 Then add your user to group "video" and "render". Now you can type "vainfo --display drm" to checkc if hardware codecs are shown.
 
+Note: the `vgem` module has to be loaded (`sudo modprobe vgem`, persist it via `/etc/modules-load.d/`).
+GPU-PV guests expose the GPU only through `/dev/dxg` and register no DRM device for it, while the
+Mesa VA-API path needs a DRM device to bind to. `vgem` is that virtual device node - the real
+decoding still runs on the host GPU through `/dev/dxg`.
+
 ### Known issues
 ~The GNOME desktop will go black when restarting, current workaround is disable GPU-PV temporarily with "Remove-VMGpuPartitionAdapter $vmName" in Powershell and add it back after entering the GNOME desktop.~
 Resolved by the GNOME version comes with Ubuntu 24.04
