@@ -808,7 +808,14 @@ upsert_block() {
     fi
 
     if [ -f "$file" ]; then cp -a "$file" "$file.bak-$STAMP"; fi
-    install -m 0644 "$out" "$file"
+
+    # Preserve the original mode instead of forcing 0644: startwm.sh is exec'd by
+    # xrdp-sesman, so dropping its +x makes the NEXT login fail with
+    # "Error calling exec (executable: /etc/xrdp/startwm.sh) returned errno: 13"
+    # and xrdp aborts the session before GNOME ever starts.
+    local filemode="0644"
+    if [ -f "$file" ]; then filemode="$(stat -c '%a' "$file")"; fi
+    install -m "$filemode" "$out" "$file"
     if [ "$owner" = "user" ]; then chown "$UUID_:$UGID" "$file"; else chown root:root "$file"; fi
     rm -f "$block" "$body" "$out"
     echo "  [OK] $file updated"
