@@ -23,21 +23,21 @@
     Target Hyper-V VM name. If omitted, a CLI numbered picker is shown (no GUI).
 
 .PARAMETER GuestUser
-    SSH user on the guest (with sudo). Default: ubuntu.
+    SSH user on the guest (with sudo). Defaults to the current Windows user name; pass it
+    explicitly when the guest login differs. Required by every guest-side stage.
 
 .PARAMETER GuestIP
-    Guest IP (host can reach it directly). Default: 10.0.0.5.
+    Address the host can SSH to: a LAN address, or a name/address plus -GuestPort when you
+    reach the guest through a port-forward. Required by every guest-side stage.
 
 .PARAMETER GuestPort
     SSH port on the guest. Default 22. Set it when reaching the guest through a
-    port-forward instead of the LAN - e.g. -GuestIP myguest.example.com -GuestPort 2222 lets the
-    guest-side stages (Ssh / Drivers / Guest / Env / Verify) run from anywhere.
+    port-forward, so the guest-side stages (Ssh / Drivers / Guest / Env / Verify) work from
+    outside the LAN.
 
 .PARAMETER ProxyUrl
-    HTTP proxy the guest uses for its own downloads (kernel, install.sh, apt).
-    Default: http://proxy.example.com:3128 - the author's LAN proxy. Pass an empty string
-    (-ProxyUrl '') or your own URL if you do not have that proxy; the value is only used
-    by -Stage Guest / All, and an empty value makes every fetch go direct.
+    HTTP proxy the guest uses for its own downloads (kernel, install.sh, apt). Empty by
+    default = fetch directly. Only -Stage Guest / All use it at all.
 
 .PARAMETER Stage
     Pipeline stage: All / GpuPv / Drivers / Guest / Env / Verify / Undo / Ssh. Default: All.
@@ -70,23 +70,24 @@
 .EXAMPLE
     .\ubuntu-gpu-pv.ps1
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -VMName MyGuestVM -GuestIP 10.0.0.5 -Force
+    .\ubuntu-gpu-pv.ps1 -VMName MyGuestVM -GuestIP 10.0.0.5 -GuestUser ubuntu -Force
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -GuestIP 10.0.0.5 -GuestUser ubuntu
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -DesktopApp 'com.microsoft.Edge.desktop'
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -GuestIP 10.0.0.5 -DesktopApp 'com.microsoft.Edge.desktop'
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -DesktopRendering Gpu
+    .\ubuntu-gpu-pv.ps1 -Stage Env -VMName MyGuestVM -GuestIP 10.0.0.5 -DesktopRendering Gpu
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Env -GuestIP myguest.example.com -GuestPort 2222
+    # guest reached through a port-forward: any routable name/address + -GuestPort
+    .\ubuntu-gpu-pv.ps1 -Stage Env -GuestIP myguest.example.com -GuestPort 2222 -GuestUser ubuntu
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Verify
+    .\ubuntu-gpu-pv.ps1 -Stage Verify -GuestIP 10.0.0.5 -GuestUser ubuntu
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage GpuPv -Gpu "discrete GPU"
+    .\ubuntu-gpu-pv.ps1 -Stage GpuPv -Gpu "GeForce"
 .EXAMPLE
     .\ubuntu-gpu-pv.ps1 -Stage Undo
 .EXAMPLE
-    .\ubuntu-gpu-pv.ps1 -Stage Ssh
+    .\ubuntu-gpu-pv.ps1 -Stage Ssh -GuestIP 10.0.0.5 -GuestUser ubuntu
 
 .NOTES
     Adapted from the staralt/dxgkrnl-dkms and ad1107 tutorials.
@@ -111,12 +112,11 @@
 
     Two rules that cost people hours:
 
-      1. GALLIUM_DRIVER is what selects the driver, and leaving it UNSET is what makes Mesa
-         fall back to llvmpipe - not "missing half of a pair". Measured on this guest
-         (Mesa 25.2, env -i): unset -> llvmpipe, d3d12 -> GPU, llvmpipe -> software;
-         MESA_LOADER_DRIVER_OVERRIDE was inert in all four combinations, and
-         MESA_D3D12_DEFAULT_ADAPTER_NAME is what keeps d3d12 off the wrong GPU
-         (without it the guest lands on the integrated GPU, not the discrete GPU).
+      1. GALLIUM_DRIVER selects the driver: d3d12 = GPU, llvmpipe = software, and leaving it
+         UNSET is what makes Mesa fall back to llvmpipe silently (not "missing half of a
+         pair"). On the GL path MESA_LOADER_DRIVER_OVERRIDE has no effect, but VA-API only
+         initialises with it set to vgem - and MESA_D3D12_DEFAULT_ADAPTER_NAME is what keeps
+         d3d12 off the wrong adapter (without it Mesa can pick the integrated GPU).
       2. Never export LD_LIBRARY_PATH=/usr/lib/wsl/lib. -Stage Guest already writes
          /etc/ld.so.conf.d/ld.wsl.conf + ldconfig, which covers CUDA/nvidia-smi. Adding
          LD_LIBRARY_PATH on top only shadows system libraries and poisons GNOME/X11.
@@ -130,10 +130,10 @@
 [CmdletBinding()]
 param(
     [string]$VMName,
-    [string]$GuestUser = 'ubuntu',
-    [string]$GuestIP   = '10.0.0.5',
+    [string]$GuestUser = $env:USERNAME,
+    [string]$GuestIP   = '',
     [int]$GuestPort    = 22,
-    [string]$ProxyUrl  = 'http://proxy.example.com:3128',
+    [string]$ProxyUrl  = '',
     [ValidateSet('All', 'GpuPv', 'Drivers', 'Guest', 'Env', 'Verify', 'Undo', 'Ssh')]
     [string]$Stage     = 'All',
     [string[]]$Gpu     = @(),
@@ -147,8 +147,8 @@ $ErrorActionPreference = 'Stop'
 
 # Guest-side stages (Ssh / Drivers / Guest / Env / Verify) reach the guest over SSH, and
 # that does not have to be the LAN address: any routable "host -p port" works, e.g.
-# -GuestIP myguest.example.com -GuestPort 2222 through a port-forward, which is how you run the
-# env stage from outside the house. ssh takes -p, scp takes -P - hence two arrays.
+# -GuestIP myguest.example.com -GuestPort 2222 through a port-forward, which is how you run
+# the env stage from outside the house. ssh takes -p, scp takes -P - hence two arrays.
 $SshOpts = @('-o', 'StrictHostKeyChecking=accept-new')
 $ScpOpts = @('-o', 'StrictHostKeyChecking=accept-new')
 if ($GuestPort -ne 22) {
@@ -167,8 +167,8 @@ if ($GuestPort -ne 22) {
 #                                    UNSET = Mesa default (which is llvmpipe on a GPU-PV guest).
 #                                    VA-API needs d3d12 here too, not just LIBVA_DRIVER_NAME.
 #   MESA_D3D12_DEFAULT_ADAPTER_NAME  picks WHICH GPU the d3d12 driver drives. Without it
-#                                    d3d12 can silently land on another adapter - on this
-#                                    host the integrated GPU instead of the discrete GPU.
+#                                    d3d12 can silently land on another adapter, e.g. the
+#                                    integrated GPU instead of the discrete one.
 #   MESA_LOADER_DRIVER_OVERRIDE      inert for GL, but LOAD-BEARING for VA-API: only 'vgem'
 #                                    initialises the VA d3d12 frontend (it binds the vgem
 #                                    DRM device). 'd3d12' and unset both die with
@@ -257,6 +257,22 @@ function Assert-Prerequisites {
     }
     else {
         Ok "Stage '$Stage' is guest-side only - Hyper-V and elevation not required"
+    }
+
+    # Guest-side stages need somewhere to connect. Validate here so a missing value fails
+    # with a clear message instead of an SSH error.
+    if ($Stage -in 'All', 'Ssh', 'Drivers', 'Guest', 'Env', 'Verify') {
+        if ([string]::IsNullOrWhiteSpace($GuestIP)) {
+            throw @"
+-GuestIP is required for -Stage $Stage. Give the address the host can SSH to, either:
+  a LAN address                      -GuestIP 10.0.0.5
+  a name/address + port-forward      -GuestIP myguest.example.com -GuestPort 2222
+"@
+        }
+        if ([string]::IsNullOrWhiteSpace($GuestUser)) {
+            throw "-GuestUser is required for -Stage ${Stage}: the SSH user on the guest (it defaults to the current Windows user name, '${env:USERNAME}')."
+        }
+        Ok "Guest target: ${GuestUser}@${GuestIP}:${GuestPort}"
     }
 
     foreach ($cmd in 'ssh', 'scp') {
@@ -611,9 +627,8 @@ echo "      6.6-6.17 -> linux-msft-wsl-6.6.y    (patches 0001 + 0002-Fix-eventfd
 echo "      6.18+    -> linux-msft-wsl-6.18.y   (patches 0001)"
 echo "      Current kernel $(uname -r) will be routed automatically."
 
-# Proxy for curl / git / apt inside the guest. Default is the author's LAN proxy; pass
-# -ProxyUrl '' (or your own URL) if you do not have it - an empty value makes every fetch
-# go direct.
+# Proxy for curl / git / apt inside the guest, from -ProxyUrl. Empty (the default) means
+# every fetch goes direct; set it only if the guest cannot reach the internet by itself.
 # Note: VM-side persistence (git config http.proxy, /etc/sudoers.d/99-gpupv-proxy env_keep,
 # ~/.bashrc export) is already in place. We only need to set PROXY_URL here so the bash
 # subprocess below has the proxy in env, which sudo will then inherit via the sudoers drop-in.
