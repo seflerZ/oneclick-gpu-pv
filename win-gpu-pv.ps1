@@ -345,7 +345,7 @@ mkdir %dirname%
 cd %dirname%
 
 "@
-        $batInstallLine = "start `"" /wait rundll32 advpack.dll,LaunchINFSectionEx $vminfpath,$($pkg.InfSection),,4"
+        $batInstallLine = "start `"`" /wait rundll32 advpack.dll,LaunchINFSectionEx $vminfpath,$($pkg.InfSection),,4"
         $batEpilog = @"
 
 cd ..
