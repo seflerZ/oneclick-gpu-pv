@@ -33,6 +33,12 @@
     port-forward instead of the LAN - e.g. -GuestIP myguest.example.com -GuestPort 2222 lets the
     guest-side stages (Ssh / Drivers / Guest / Env / Verify) run from anywhere.
 
+.PARAMETER ProxyUrl
+    HTTP proxy the guest uses for its own downloads (kernel, install.sh, apt).
+    Default: http://proxy.example.com:3128 - the author's LAN proxy. Pass an empty string
+    (-ProxyUrl '') or your own URL if you do not have that proxy; the value is only used
+    by -Stage Guest / All, and an empty value makes every fetch go direct.
+
 .PARAMETER Stage
     Pipeline stage: All / GpuPv / Drivers / Guest / Env / Verify / Undo / Ssh. Default: All.
     Env deploys the guest-side GPU-PV environment variables (see NOTES); Verify prints a
@@ -127,6 +133,7 @@ param(
     [string]$GuestUser = 'ubuntu',
     [string]$GuestIP   = '10.0.0.5',
     [int]$GuestPort    = 22,
+    [string]$ProxyUrl  = 'http://proxy.example.com:3128',
     [ValidateSet('All', 'GpuPv', 'Drivers', 'Guest', 'Env', 'Verify', 'Undo', 'Ssh')]
     [string]$Stage     = 'All',
     [string[]]$Gpu     = @(),
@@ -604,24 +611,33 @@ echo "      6.6-6.17 -> linux-msft-wsl-6.6.y    (patches 0001 + 0002-Fix-eventfd
 echo "      6.18+    -> linux-msft-wsl-6.18.y   (patches 0001)"
 echo "      Current kernel $(uname -r) will be routed automatically."
 
-# Force HTTP proxy for curl / git / apt (raw.githubusercontent.com + microsoft kernel need it)
+# Proxy for curl / git / apt inside the guest. Default is the author's LAN proxy; pass
+# -ProxyUrl '' (or your own URL) if you do not have it - an empty value makes every fetch
+# go direct.
 # Note: VM-side persistence (git config http.proxy, /etc/sudoers.d/99-gpupv-proxy env_keep,
 # ~/.bashrc export) is already in place. We only need to set PROXY_URL here so the bash
 # subprocess below has the proxy in env, which sudo will then inherit via the sudoers drop-in.
-PROXY_URL="http://proxy.example.com:3128"
+PROXY_URL="@@PROXYURL@@"
 NO_PROXY="localhost,127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,*.local"
-export http_proxy="$PROXY_URL"
-export https_proxy="$PROXY_URL"
-export HTTP_PROXY="$PROXY_URL"
-export HTTPS_PROXY="$PROXY_URL"
-export no_proxy="$NO_PROXY"
-export NO_PROXY="$NO_PROXY"
-echo "  Proxy: $PROXY_URL"
+
+PROXY_ARG=()
+if [ -n "$PROXY_URL" ]; then
+    export http_proxy="$PROXY_URL"
+    export https_proxy="$PROXY_URL"
+    export HTTP_PROXY="$PROXY_URL"
+    export HTTPS_PROXY="$PROXY_URL"
+    export no_proxy="$NO_PROXY"
+    export NO_PROXY="$NO_PROXY"
+    PROXY_ARG=(--proxy "$PROXY_URL")
+    echo "  Proxy: $PROXY_URL"
+else
+    echo "  Proxy: (none - fetching directly)"
+fi
 
 # Pull install.sh locally, then patch two things before running:
 #   1. git clone gets --filter=blob:none (microsoft/WSL2-Linux-Kernel is huge, breaks through proxies)
 #   2. patch URLs go through raw.githubusercontent.com (adds retry + timeouts)
-curl -fsSL --max-time 60 --retry 5 --proxy "$PROXY_URL" \
+curl -fsSL --max-time 60 --retry 5 "${PROXY_ARG[@]}" \
     https://raw.githubusercontent.com/staralt/dxgkrnl-dkms/main/install.sh -o /tmp/install.sh
 chmod +x /tmp/install.sh
 sed -i 's|git clone --branch=|git clone --filter=blob:none --branch=|'   /tmp/install.sh
@@ -629,7 +645,9 @@ sed -i 's|https://content.staralt.dev/dxgkrnl-dkms/main|https://raw.githubuserco
 # Force every curl inside install.sh to use the proxy too (defense in depth against
 # sudo env_reset stripping http_proxy). Use double quotes so bash expands $PROXY_URL
 # at substitution time -- install.sh doesn't see PROXY_URL when it runs.
-sed -i "s|curl -fsSL|curl -fsSL --proxy ${PROXY_URL}|g" /tmp/install.sh
+if [ -n "$PROXY_URL" ]; then
+    sed -i "s|curl -fsSL|curl -fsSL --proxy ${PROXY_URL}|g" /tmp/install.sh
+fi
 sudo /tmp/install.sh
 
 echo ""
@@ -715,8 +733,13 @@ function Invoke-GuestSetup {
 
     Step 'Stage 3 / Guest installation'
 
+    $script = $guestSetupBash.Replace('@@PROXYURL@@', $ProxyUrl)
+    if ([string]::IsNullOrWhiteSpace($ProxyUrl)) {
+        Warn 'No proxy configured (-ProxyUrl empty) - the guest will fetch everything directly.'
+    }
+
     $tmp = Join-Path $env:TEMP 'gpupv-guest-setup.sh'
-    [IO.File]::WriteAllText($tmp, ($guestSetupBash -replace "`r`n", "`n"))
+    [IO.File]::WriteAllText($tmp, ($script -replace "`r`n", "`n"))
 
     Write-Host '  Uploading the guest install script...'
     & scp @ScpOpts $tmp "${User}@${IP}:~/gpupv-guest-setup.sh"
@@ -890,7 +913,19 @@ else
     done
 
     if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$UHOME/.local/share/applications" 2>/dev/null || true
+        # Must run as the owning user: this script runs under sudo, and doing it as root
+        # leaves a root-owned mimeinfo.cache inside the user's applications dir.
+        if [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$SUDO_USER" update-desktop-database "$UHOME/.local/share/applications" 2>/dev/null || true
+        else
+            update-desktop-database "$UHOME/.local/share/applications" 2>/dev/null || true
+        fi
+        # Self-heal a cache a previous run left root-owned.
+        CACHE="$UHOME/.local/share/applications/mimeinfo.cache"
+        if [ -f "$CACHE" ]; then
+            OWNER="$(stat -c '%u' "$CACHE")"
+            if [ "$OWNER" != "$UUID_" ]; then chown "$UUID_:$UGID" "$CACHE"; fi
+        fi
     fi
 fi
 
@@ -1176,26 +1211,34 @@ switch ($Stage) {
     }
 }
 
-Write-Host ''
-Write-Host '============================ All done ============================' -ForegroundColor Green
-Write-Host 'Optional follow-up:'
-Write-Host '  1) Guest tooling: sudo apt install -y vainfo mesa-utils mesa-vulkan-drivers mesa-va-drivers vulkan-tools'
-Write-Host '  2) Environment variables were deployed by -Stage Env (idempotent marker block):'
-Write-Host '       /etc/environment      -> d3d12            (PAM: SSH sessions + systemd services)'
-Write-Host '       ~/.zshenv             -> d3d12            (terminal inside the desktop)'
-Write-Host "       /etc/xrdp/startwm.sh  -> llvmpipe/swrast  (desktop session only; -DesktopRendering Gpu to drop it)"
-Write-Host '       ~/.local/share/applications/*.desktop      -> d3d12 (dock apps; -DesktopApp <name.desktop>)'
-Write-Host '       Re-run any time: .\ubuntu-gpu-pv.ps1 -Stage Env -VMName <vm>; -Stage Verify to health-check.'
-Write-Host '     * Never export LD_LIBRARY_PATH=/usr/lib/wsl/lib: -Stage Guest already writes'
-Write-Host '       /etc/ld.so.conf.d/ld.wsl.conf + ldconfig. Adding it on top only shadows system'
-Write-Host '       libs and poisons GNOME/X11 - and /etc/profile.d is never read by a GUI session.'
-Write-Host '     * GALLIUM_DRIVER is the switch (d3d12 = GPU, llvmpipe = software). Leaving it'
-Write-Host '       UNSET is what causes a silent llvmpipe fallback - and d3d12 without'
-Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (the integrated GPU here).'
-Write-Host '     * Hardware video (VA-API) needs THREE things at once: GALLIUM_DRIVER=d3d12,'
-Write-Host '       MESA_LOADER_DRIVER_OVERRIDE=vgem, and the vgem device loaded. The software-'
-Write-Host '       rendered desktop cannot have it - opt in per app (-DesktopApp) or a terminal.'
-Write-Host '  3) Recommended desktop: GNOME on Ubuntu 24.04+. On 22.04 mutter crashes in this stack;'
-Write-Host '     use LXQt / Xfce instead, or upgrade the guest to 24.04 where the fix is upstream.'
-Write-Host ''
-Write-Host 'Undo: .\ubuntu-gpu-pv.ps1 -Stage Undo' -ForegroundColor DarkGray
+# The long follow-up block is written for a fresh full run. Printing it after a targeted
+# stage (-Stage Env -DesktopApp vlc.desktop, say) just buries the two lines that matter.
+if ($Stage -eq 'All') {
+    Write-Host ''
+    Write-Host '============================ All done ============================' -ForegroundColor Green
+    Write-Host 'Optional follow-up:'
+    Write-Host '  1) Guest tooling: sudo apt install -y vainfo mesa-utils mesa-vulkan-drivers mesa-va-drivers vulkan-tools'
+    Write-Host '  2) Environment variables were deployed by -Stage Env (idempotent marker block):'
+    Write-Host '       /etc/environment      -> d3d12            (PAM: SSH sessions + systemd services)'
+    Write-Host '       ~/.zshenv             -> d3d12            (terminal inside the desktop)'
+    Write-Host "       /etc/xrdp/startwm.sh  -> llvmpipe/swrast  (desktop session only; -DesktopRendering Gpu to drop it)"
+    Write-Host '       ~/.local/share/applications/*.desktop      -> d3d12 (dock apps; -DesktopApp <name.desktop>)'
+    Write-Host '       Re-run any time: .\ubuntu-gpu-pv.ps1 -Stage Env -VMName <vm>; -Stage Verify to health-check.'
+    Write-Host '     * Never export LD_LIBRARY_PATH=/usr/lib/wsl/lib: -Stage Guest already writes'
+    Write-Host '       /etc/ld.so.conf.d/ld.wsl.conf + ldconfig. Adding it on top only shadows system'
+    Write-Host '       libs and poisons GNOME/X11 - and /etc/profile.d is never read by a GUI session.'
+    Write-Host '     * GALLIUM_DRIVER is the switch (d3d12 = GPU, llvmpipe = software). Leaving it'
+    Write-Host '       UNSET is what causes a silent llvmpipe fallback - and d3d12 without'
+    Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (the integrated GPU here).'
+    Write-Host '     * Hardware video (VA-API) needs THREE things at once: GALLIUM_DRIVER=d3d12,'
+    Write-Host '       MESA_LOADER_DRIVER_OVERRIDE=vgem, and the vgem device loaded. The software-'
+    Write-Host '       rendered desktop cannot have it - opt in per app (-DesktopApp) or a terminal.'
+    Write-Host '  3) Recommended desktop: GNOME on Ubuntu 24.04+. On 22.04 mutter crashes in this stack;'
+    Write-Host '     use LXQt / Xfce instead, or upgrade the guest to 24.04 where the fix is upstream.'
+    Write-Host ''
+    Write-Host 'Undo: .\ubuntu-gpu-pv.ps1 -Stage Undo' -ForegroundColor DarkGray
+}
+else {
+    Write-Host ''
+    Write-Host "Stage '$Stage' done." -ForegroundColor Green
+}
