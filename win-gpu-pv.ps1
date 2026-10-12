@@ -51,8 +51,7 @@
     Author: seflerZ
     Project: https://github.com/seflerZ/oneclick-gpu-pv
 
-    Tested on Windows 10/11 + Hyper-V with consumer NVIDIA GPUs (GeForce
-    class). For Linux guests, use the companion ubuntu-gpu-pv.ps1 script
+    Tested on Windows 10/11 + Hyper-V with consumer NVIDIA GPUs. For Linux guests, use the companion ubuntu-gpu-pv.ps1 script
     instead.
 
     The script does NOT depend on the host's UI language. The original
