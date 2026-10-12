@@ -1244,7 +1244,7 @@ if ($Stage -eq 'All') {
     Write-Host '       libs and poisons GNOME/X11 - and /etc/profile.d is never read by a GUI session.'
     Write-Host '     * GALLIUM_DRIVER is the switch (d3d12 = GPU, llvmpipe = software). Leaving it'
     Write-Host '       UNSET is what causes a silent llvmpipe fallback - and d3d12 without'
-    Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (the integrated GPU here).'
+    Write-Host '       MESA_D3D12_DEFAULT_ADAPTER_NAME can drive the wrong GPU (e.g. the integrated one).'
     Write-Host '     * Hardware video (VA-API) needs THREE things at once: GALLIUM_DRIVER=d3d12,'
     Write-Host '       MESA_LOADER_DRIVER_OVERRIDE=vgem, and the vgem device loaded. The software-'
     Write-Host '       rendered desktop cannot have it - opt in per app (-DesktopApp) or a terminal.'
